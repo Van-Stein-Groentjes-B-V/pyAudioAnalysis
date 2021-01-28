@@ -5,6 +5,7 @@ import glob
 import scipy
 import sklearn
 import numpy as np
+import pandas as pd
 import hmmlearn.hmm
 import sklearn.cluster
 import pickle as cpickle
@@ -15,7 +16,6 @@ from pyAudioAnalysis import audioBasicIO
 from pyAudioAnalysis import audioTrainTest as at
 from pyAudioAnalysis import MidTermFeatures as mtf
 from pyAudioAnalysis import ShortTermFeatures as stf
-
 """ General utility functions """
 
 
@@ -813,7 +813,7 @@ def speaker_diarization(filename, n_speakers, mid_window=2.0, mid_step=0.2,
     sampling_rate, signal = audioBasicIO.read_audio_file(filename)
     signal = audioBasicIO.stereo_to_mono(signal)
     duration = len(signal) / sampling_rate
-
+    print(duration)
     base_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                             "data/models")
 
@@ -868,7 +868,6 @@ def speaker_diarization(filename, n_speakers, mid_window=2.0, mid_step=0.2,
 
     mt_feats_norm_or = mid_feats_norm
     mid_feats_norm = mid_feats_norm[:, i_non_outliers]
-
     # LDA dimensionality reduction:
     if lda_dim > 0:
 
@@ -932,7 +931,6 @@ def speaker_diarization(filename, n_speakers, mid_window=2.0, mid_step=0.2,
     cluster_labels = []
     sil_all = []
     cluster_centers = []
-    
     for speakers in s_range:
         k_means = sklearn.cluster.KMeans(n_clusters=speakers)
         k_means.fit(mid_feats_norm.T)
@@ -1048,8 +1046,294 @@ def speaker_diarization(filename, n_speakers, mid_window=2.0, mid_step=0.2,
             plt.xlabel("number of clusters")
             plt.ylabel("average clustering's sillouette")
         plt.show()
-    return cls
+    return cls, mt_feats_norm_or.T
 
+def speaker_diarization_doa(filename, tested_weight, n_speakers, doa, mid_window=2.0, mid_step=0.2,
+                        short_window=0.05, lda_dim=35, plot_res=False):
+    """
+    ARGUMENTS:
+        - filename:        the name of the WAV file to be analyzed
+        - n_speakers       the number of speakers (clusters) in
+                           the recording (<=0 for unknown)
+        - mid_window (opt)    mid-term window size
+        - mid_step (opt)    mid-term window step
+        - short_window  (opt)    short-term window size
+        - lda_dim (opt     LDA dimension (0 for no LDA)
+        - plot_res         (opt)   0 for not plotting the results 1 for plotting
+    """
+    sampling_rate, signal = audioBasicIO.read_audio_file(filename)
+    signal = audioBasicIO.stereo_to_mono(signal)
+    duration = len(signal) / sampling_rate
+    print(duration)
+    base_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                            "data/models")
+
+    classifier_all, mean_all, std_all, class_names_all, _, _, _, _, _ = \
+        at.load_model_knn(os.path.join(base_dir, "knn_speaker_10"))
+    classifier_fm, mean_fm, std_fm, class_names_fm, _, _, _, _,  _ = \
+        at.load_model_knn(os.path.join(base_dir, "knn_speaker_male_female"))
+
+    mid_feats, st_feats, _ = \
+        mtf.mid_feature_extraction(signal, sampling_rate,
+                                   mid_window * sampling_rate,
+                                   mid_step * sampling_rate,
+                                   round(sampling_rate * short_window),
+                                   round(sampling_rate * short_window * 0.5))
+
+    
+    mid_term_features = np.zeros((mid_feats.shape[0] + len(class_names_all) +
+                                  len(class_names_fm), mid_feats.shape[1]))
+
+    for index in range(mid_feats.shape[1]):
+        feature_norm_all = (mid_feats[:, index] - mean_all) / std_all
+        feature_norm_fm = (mid_feats[:, index] - mean_fm) / std_fm
+        _, p1 = at.classifier_wrapper(classifier_all, "knn", feature_norm_all)
+        _, p2 = at.classifier_wrapper(classifier_fm, "knn", feature_norm_fm)
+        start = mid_feats.shape[0]
+        end = mid_feats.shape[0] + len(class_names_all)
+        mid_term_features[0:mid_feats.shape[0], index] = mid_feats[:, index]
+        mid_term_features[start:end, index] = p1 + 1e-4
+        mid_term_features[end::, index] = p2 + 1e-4
+
+    mid_feats = mid_term_features    # TODO
+    feature_selected = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 41,
+                        42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
+
+    mid_feats = mid_feats[feature_selected, :]
+
+    #start added code
+    #add doa values to mt_feats
+    mid_feats = mid_feats.T
+    b = np.zeros((mid_feats.shape[0],mid_feats.shape[1]+1))
+    b[:,:-1] = mid_feats
+
+    #getting perfect doa values
+    needed = [] #list of perfect row values
+    step = duration/mid_feats.shape[0]
+    for i in range (mid_feats.shape[0]):
+        needed.append(i*step)
+
+
+    #gets doa values
+    to_get = [] #list of index of rows to get. row contains closes doa value to one of the perfect values from needed
+    for i in needed:
+        result_index = doa['rowtime'].sub(i).abs().idxmin() #subtracts search value from df to make nearest almost 0, make almost 0 minimum of column
+        to_get.append(result_index)
+
+    df = pd.DataFrame()
+    for i in to_get:
+        value = doa.loc[[i]]
+        df = df.append(value, ignore_index=True)
+    print(df)
+    #insert into matrix
+    arr = df["Doa_value"].to_numpy()
+    b[:,-1]= arr
+    mid_feats = b.T
+    # end of added code
+    
+    mid_feats_norm, mean, std = at.normalize_features([mid_feats.T])
+    mid_feats_norm = mid_feats_norm[0].T
+    n_wins = mid_feats.shape[1]
+
+    # remove outliers:
+    dist_all = np.sum(distance.squareform(distance.pdist(mid_feats_norm.T)),
+                      axis=0)
+    m_dist_all = np.mean(dist_all)
+    i_non_outliers = np.nonzero(dist_all < 1.2 * m_dist_all)[0]
+
+    # TODO: Combine energy threshold for outlier removal:
+    # EnergyMin = np.min(mt_feats[1,:])
+    # EnergyMean = np.mean(mt_feats[1,:])
+    # Thres = (1.5*EnergyMin + 0.5*EnergyMean) / 2.0
+    # i_non_outliers = np.nonzero(mt_feats[1,:] > Thres)[0]
+    # print i_non_outliers
+
+    mt_feats_norm_or = mid_feats_norm
+    mid_feats_norm = mid_feats_norm[:, i_non_outliers]
+    # LDA dimensionality reduction:
+    if lda_dim > 0:
+
+        # extract mid-term features with minimum step:
+        window_ratio = int(round(mid_window / short_window))
+        step_ratio = int(round(short_window / short_window))
+        mt_feats_to_red = []
+        num_of_features = len(st_feats)
+        num_of_stats = 2
+        for index in range(num_of_stats * num_of_features):
+            mt_feats_to_red.append([])
+
+        # for each of the short-term features:
+        for index in range(num_of_features):
+            cur_pos = 0
+            feat_len = len(st_feats[index])
+            while cur_pos < feat_len:
+                n1 = cur_pos
+                n2 = cur_pos + window_ratio
+                if n2 > feat_len:
+                    n2 = feat_len
+                short_features = st_feats[index][n1:n2]
+                mt_feats_to_red[index].append(np.mean(short_features))
+                mt_feats_to_red[index + num_of_features].\
+                    append(np.std(short_features))
+                cur_pos += step_ratio
+        mt_feats_to_red = np.array(mt_feats_to_red)
+        mt_feats_to_red_2 = np.zeros((mt_feats_to_red.shape[0] +
+                                      len(class_names_all) +
+                                      len(class_names_fm),
+                                      mt_feats_to_red.shape[1]))
+        limit = mt_feats_to_red.shape[0] + len(class_names_all)
+        for index in range(mt_feats_to_red.shape[1]):
+            feature_norm_all = (mt_feats_to_red[:, index] - mean_all) / std_all
+            feature_norm_fm = (mt_feats_to_red[:, index] - mean_fm) / std_fm
+            _, p1 = at.classifier_wrapper(classifier_all, "knn",
+                                          feature_norm_all)
+            _, p2 = at.classifier_wrapper(classifier_fm, "knn", feature_norm_fm)
+            mt_feats_to_red_2[0:mt_feats_to_red.shape[0], index] = \
+                mt_feats_to_red[:, index]
+            mt_feats_to_red_2[mt_feats_to_red.shape[0]:limit, index] = p1 + 1e-4
+            mt_feats_to_red_2[limit::, index] = p2 + 1e-4
+        mt_feats_to_red = mt_feats_to_red_2
+        mt_feats_to_red = mt_feats_to_red[feature_selected, :]
+        mt_feats_to_red, mean, std = at.normalize_features([mt_feats_to_red.T])
+        mt_feats_to_red = mt_feats_to_red[0].T
+        labels = np.zeros((mt_feats_to_red.shape[1], ))
+        lda_step = 1.0
+        lda_step_ratio = lda_step / short_window
+        for index in range(labels.shape[0]):
+            labels[index] = int(index * short_window / lda_step_ratio)
+        clf = sklearn.discriminant_analysis.\
+            LinearDiscriminantAnalysis(n_components=lda_dim)
+        clf.fit(mt_feats_to_red.T, labels)
+        mid_feats_norm = (clf.transform(mid_feats_norm.T)).T
+
+    if n_speakers <= 0:
+        s_range = range(2, 10)
+    else:
+        s_range = [n_speakers]
+    cluster_labels = []
+    sil_all = []
+    cluster_centers = []
+    for speakers in s_range:
+        k_means = sklearn.cluster.KMeans(n_clusters=speakers)
+        weight = []
+        for i in range(mid_feats_norm.T.shape[0]-1):
+            weight.append(1)
+        weight.append(tested_weight)
+        print(weight)
+        k_means.fit(X=mid_feats_norm.T, sample_weight=weight)
+        cls = k_means.labels_        
+        means = k_means.cluster_centers_
+
+        cluster_labels.append(cls)
+        cluster_centers.append(means)
+        sil_1 = []; sil_2 = []
+        for c in range(speakers):
+            # for each speaker (i.e. for each extracted cluster)
+            clust_per_cent = np.nonzero(cls == c)[0].shape[0] / float(len(cls))
+            if clust_per_cent < 0.020:
+                sil_1.append(0.0)
+                sil_2.append(0.0)
+            else:
+                # get subset of feature vectors
+                mt_feats_norm_temp = mid_feats_norm[:, cls == c]
+                # compute average distance between samples
+                # that belong to the cluster (a values)
+                dist = distance.pdist(mt_feats_norm_temp.T)
+                sil_1.append(np.mean(dist)*clust_per_cent)
+                sil_temp = []
+                for c2 in range(speakers):
+                    # compute distances from samples of other clusters
+                    if c2 != c:
+                        clust_per_cent_2 = np.nonzero(cls == c2)[0].shape[0] /\
+                                           float(len(cls))
+                        mid_features_temp = mid_feats_norm[:, cls == c2]
+                        dist = distance.cdist(mt_feats_norm_temp.T,
+                                              mid_features_temp.T)
+                        sil_temp.append(np.mean(dist)*(clust_per_cent
+                                                       + clust_per_cent_2)/2.0)
+                sil_temp = np.array(sil_temp)
+                # ... and keep the minimum value (i.e.
+                # the distance from the "nearest" cluster)
+                sil_2.append(min(sil_temp))
+        sil_1 = np.array(sil_1)
+        sil_2 = np.array(sil_2)
+        sil = []
+        for c in range(speakers):
+            # for each cluster (speaker) compute silhouette
+            sil.append((sil_2[c] - sil_1[c]) / (max(sil_2[c], sil_1[c]) + 1e-5))
+        # keep the AVERAGE SILLOUETTE
+        sil_all.append(np.mean(sil))
+
+    imax = int(np.argmax(sil_all))
+    # optimal number of clusters
+    num_speakers = s_range[imax]
+
+    # generate the final set of cluster labels
+    # (important: need to retrieve the outlier windows:
+    # this is achieved by giving them the value of their
+    # nearest non-outlier window)
+    cls = np.zeros((n_wins,))
+    for index in range(n_wins):
+        j = np.argmin(np.abs(index-i_non_outliers))
+        cls[index] = cluster_labels[imax][j]
+        
+    # Post-process method 1: hmm smoothing
+    for index in range(1):
+        # hmm training
+        start_prob, transmat, means, cov = \
+            train_hmm_compute_statistics(mt_feats_norm_or, cls)
+        hmm = hmmlearn.hmm.GaussianHMM(start_prob.shape[0], "diag")
+        hmm.startprob_ = start_prob
+        hmm.transmat_ = transmat            
+        hmm.means_ = means; hmm.covars_ = cov
+        cls = hmm.predict(mt_feats_norm_or.T)                    
+    
+    # Post-process method 2: median filtering:
+    cls = scipy.signal.medfilt(cls, 13)
+    cls = scipy.signal.medfilt(cls, 11)
+
+    class_names = ["speaker{0:d}".format(c) for c in range(num_speakers)]
+
+    # load ground-truth if available
+    gt_file = filename.replace('.wav', '.segments')
+    # if groundtruth exists
+    if os.path.isfile(gt_file):
+        seg_start, seg_end, seg_labs = read_segmentation_gt(gt_file)
+        flags_gt, class_names_gt = segments_to_labels(seg_start, seg_end,
+                                                      seg_labs, mid_step)
+
+    if plot_res:
+        fig = plt.figure()    
+        if n_speakers > 0:
+            ax1 = fig.add_subplot(111)
+        else:
+            ax1 = fig.add_subplot(211)
+        ax1.set_yticks(np.array(range(len(class_names))))
+        ax1.axis((0, duration, -1, len(class_names)))
+        ax1.set_yticklabels(class_names)
+        ax1.plot(np.array(range(len(cls))) * mid_step + mid_step / 2.0, cls)
+
+    if os.path.isfile(gt_file):
+        if plot_res:
+            ax1.plot(np.array(range(len(flags_gt))) *
+                     mid_step + mid_step / 2.0, flags_gt, 'r')
+        purity_cluster_m, purity_speaker_m = \
+            evaluate_speaker_diarization(cls, flags_gt)
+        print("{0:.1f}\t{1:.1f}".format(100 * purity_cluster_m,
+                                        100 * purity_speaker_m))
+        if plot_res:
+            plt.title("Cluster purity: {0:.1f}% - "
+                      "Speaker purity: {1:.1f}%".format(100 * purity_cluster_m,
+                                                        100 * purity_speaker_m))
+    if plot_res:
+        plt.xlabel("time (seconds)")
+        if n_speakers <= 0:
+            plt.subplot(212)
+            plt.plot(s_range, sil_all)
+            plt.xlabel("number of clusters")
+            plt.ylabel("average clustering's sillouette")
+        plt.show()
+    return cls, mt_feats_norm_or.T
 
 def speaker_diarization_evaluation(folder_name, lda_dimensions):
     """
